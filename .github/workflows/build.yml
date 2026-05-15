@@ -1086,9 +1086,9 @@ jobs:
           fi
 
           if [ -n "$CUSTOM_TAG" ]; then
-            VERSION_TEMPLATE="v\$1-$CUSTOM_TAG@$BRANCH_NAME[$GIT_HASH]"
+            VERSION_TEMPLATE="v\$1-$CUSTOM_TAG-@南城定制内核"
           else
-            VERSION_TEMPLATE="v\$1-$GIT_HASH@$BRANCH_NAME"
+            VERSION_TEMPLATE="v\$1-$GIT_HASH-@南城定制内核"
           fi
 
           awk -v body="$VERSION_TEMPLATE" '
