@@ -160,6 +160,7 @@ object KernelSupport {
 
     fun normalize(config: KernelBuildConfig): KernelBuildConfig {
         val line = lineFor(config.androidVersion, config.kernelVersion)
+        val ksuVariant = normalizeKsuVariant(config.kernelsuVariant)
         val subLevel = when {
             config.subLevel == "X" -> "X"
             subLevels(line).contains(config.subLevel) -> config.subLevel
@@ -175,11 +176,13 @@ object KernelSupport {
             kernelVersion = line.kernelVersion,
             subLevel = subLevel,
             osPatchLevel = osPatch,
+            kernelsuVariant = ksuVariant,
             kernelsuBranch = normalizeKsuBranch(
-                config.cancelSusfs,
-                config.kernelsuVariant,
-                config.kernelsuBranch
+                if (ksuVariant == KSU_VARIANT_NONE) KSU_BRANCH_STABLE else config.kernelsuBranch
             ),
+            useKpm = if (ksuVariant == KSU_VARIANT_NONE) false else config.useKpm,
+            cancelSusfs = if (ksuVariant == KSU_VARIANT_NONE) true else config.cancelSusfs,
+            kpmPassword = if (ksuVariant == KSU_VARIANT_NONE) "" else config.kpmPassword,
             virtualizationSupport = normalizeVirtualizationSupport(line.kernelVersion, config.virtualizationSupport),
             customExternalModules = config.customExternalModules.orEmpty()
                 .mapNotNull { module ->
@@ -197,22 +200,20 @@ object KernelSupport {
         )
     }
 
-    fun ksuBranchOptions(cancelSusfs: Boolean, kernelsuVariant: String): List<String> =
-        if (usesSusfsAutoBranch(cancelSusfs, kernelsuVariant)) {
-            listOf(KSU_BRANCH_SUSFS)
-        } else {
-            KSU_BRANCH_STANDARD_OPTIONS
-        }
+    fun ksuVariantOptions(): List<String> = KSU_VARIANT_OPTIONS
 
-    fun normalizeKsuBranch(cancelSusfs: Boolean, kernelsuVariant: String, value: String): String =
-        if (usesSusfsAutoBranch(cancelSusfs, kernelsuVariant)) {
-            KSU_BRANCH_SUSFS
-        } else {
-            value.takeIf { it in KSU_BRANCH_STANDARD_OPTIONS } ?: KSU_BRANCH_STABLE
-        }
+    fun normalizeKsuVariant(value: String): String = when (value.trim().lowercase()) {
+        KSU_VARIANT_OFFICIAL.lowercase() -> KSU_VARIANT_OFFICIAL
+        KSU_VARIANT_SUKISU.lowercase() -> KSU_VARIANT_SUKISU
+        KSU_VARIANT_RESUKISU.lowercase() -> KSU_VARIANT_RESUKISU
+        KSU_VARIANT_NONE.lowercase(), "无" -> KSU_VARIANT_NONE
+        else -> KSU_VARIANT_RESUKISU
+    }
 
-    fun usesSusfsAutoBranch(cancelSusfs: Boolean, kernelsuVariant: String): Boolean =
-        !cancelSusfs && kernelsuVariant != "ReSukiSU"
+    fun ksuBranchOptions(): List<String> = KSU_BRANCH_STANDARD_OPTIONS
+
+    fun normalizeKsuBranch(value: String): String =
+        value.takeIf { it in KSU_BRANCH_STANDARD_OPTIONS } ?: KSU_BRANCH_STABLE
 
     fun virtualizationSupportOptions(kernelVersion: String): List<String> =
         if (kernelVersion == "6.12") listOf("off", "on") else listOf("off", "678", "123", "345")
