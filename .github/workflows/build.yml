@@ -400,6 +400,24 @@ jobs:
               | jq -r --argjson idx "$INDEX" '.workflow_runs[$idx].head_sha'
           }
 
+          check_ref() {
+            REPO="$1"
+            if [[ "$custom_ref_input" =~ ^[A-Fa-f0-9]{40}$ ]]; then
+              MSG=$(curl -s "https://api.github.com/repos/$REPO/commits/$custom_ref_input" \
+                      | jq -r '.message // empty')
+            elif [[ "$custom_ref_input" =~ ^[Vv]?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              MSG=$(curl -s "https://api.github.com/repos/$REPO/git/ref/tags/$custom_ref_input" \
+                      | jq -r '.message // empty')
+            else
+              MSG=$(curl -s "https://api.github.com/repos/$REPO/branches/$custom_ref_input" \
+                      | jq -r '.message // empty')
+            fi
+            if echo "$MSG" | grep -qi "no.*found"; then
+              echo "error: '$custom_ref_input' 在 $REPO 中不存在"
+              exit 1
+            fi
+          }
+
           if [ "$branch_input" = "Custom(自定义)" ]; then
             # 分支名:数字（如 main:5 → 第 5 个成功构建）
             if [[ "$custom_ref_input" =~ ^([A-Za-z0-9._/-]+):([0-9]+)$ ]]; then
@@ -415,6 +433,15 @@ jobs:
                 RESUKISU_CUSTOM_REF="$(get_success_action_sha "ReSukiSU/ReSukiSU" "$BRANCH" "$NABE")"
               fi
             else
+              if [ "$variant_input" = "Official" ]; then
+                check_ref "tiann/KernelSU"
+              fi
+              if [ "$variant_input" = "SukiSU" ]; then
+                check_ref "ShirkNeko/susfs4ksu"
+              fi
+              if [ "$variant_input" = "ReSukiSU" ]; then
+                check_ref "ReSukiSU/ReSukiSU"
+              fi
               OFFICIAL_CUSTOM_REF="$custom_ref_input"
               SUKISU_CUSTOM_REF="$custom_ref_input"
               RESUKISU_CUSTOM_REF="$custom_ref_input"
@@ -1595,15 +1622,15 @@ jobs:
               fi
               if sub_in_range "$CURRENT_SUB" 98 127; then
                 apply_susfs_base_patch "Android 15 - 6.6 base.c" "a15-6.6/base.c.patch"
-                # 修复 6.6.98~6.6.127: fs/proc/base.c 头部 hunk 失配，导致 susfs_def.h 漏打
-                if grep -q 'AS_FLAGS_SUS_MAP\|susfs_is_current_proc_umounted\|SUSFS_IS_INODE_SUS_MAP\|SUSFS_IS_INODE_OPEN_REDIRECT' ./fs/proc/base.c && ! grep -qF 'susfs_def.h' ./fs/proc/base.c; then
-                  if ! grep -qF '#include <linux/dma-buf.h>' ./fs/proc/base.c; then
-                    sed -i '/#include <linux\/cpufreq_times.h>/a #include <linux\/dma-buf.h>' ./fs/proc/base.c
-                  fi
-                  sed -i '/#include <linux\/dma-buf.h>/a #endif' ./fs/proc/base.c
-                  sed -i '/#include <linux\/dma-buf.h>/a #include <linux\/susfs_def.h>' ./fs/proc/base.c
-                  sed -i '/#include <linux\/dma-buf.h>/a #if defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)' ./fs/proc/base.c
+              fi
+              # 修复 fs/proc/base.c 缺少 susfs_def.h (不限 sublevel，检测到宏调用但缺头文件时注入)
+              if grep -q 'AS_FLAGS_SUS_MAP\|susfs_is_current_proc_umounted\|SUSFS_IS_INODE_SUS_MAP\|SUSFS_IS_INODE_OPEN_REDIRECT' ./fs/proc/base.c && ! grep -qF 'susfs_def.h' ./fs/proc/base.c; then
+                if ! grep -qF '#include <linux/dma-buf.h>' ./fs/proc/base.c; then
+                  sed -i '/#include <linux\/cpufreq_times.h>/a #include <linux\/dma-buf.h>' ./fs/proc/base.c
                 fi
+                sed -i '/#include <linux\/dma-buf.h>/a #endif' ./fs/proc/base.c
+                sed -i '/#include <linux\/dma-buf.h>/a #include <linux\/susfs_def.h>' ./fs/proc/base.c
+                sed -i '/#include <linux\/dma-buf.h>/a #if defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)' ./fs/proc/base.c
               fi
               if sub_in_range "$CURRENT_SUB" 50 58; then
                 apply_susfs_optional_patch "Android 15 - 6.6 task_mmu.c" "a15-6.6/task_mmu.c.patch"
@@ -2746,6 +2773,54 @@ jobs:
                   raise SystemExit(f"include anchor not found: {anchor.strip()}")
               return text.replace(anchor, anchor + line, 1)
 
+          def patch_official_selinux_hide(ksu_dir):
+              path = ksu_dir / "feature/selinux_hide.c"
+              if not path.exists():
+                  return False
+
+              text = path.read_text()
+              original = text
+
+              dump_is_pointer = re.search(r"\(\s*\*\s*security_dump_masked_av_fn\s*\)", text) is not None
+              compute_is_pointer = re.search(r"\(\s*\*\s*context_struct_compute_av_fn\s*\)", text) is not None
+
+              if dump_is_pointer:
+                  text = re.sub(
+                      r"(?m)^([ \t]*)if \(security_dump_masked_av_fn\)\s*$",
+                      r"\1if (security_dump_masked_av_fn != NULL)",
+                      text,
+                  )
+              else:
+                  text = re.sub(
+                      r'(?m)^([ \t]*)if \(security_dump_masked_av_fn\)\n[ \t]*security_dump_masked_av_fn\(policydb, scontext, tcontext, tclass, masked, "bounds"\);\n',
+                      r'\1security_dump_masked_av_fn(policydb, scontext, tcontext, tclass, masked, "bounds");\n',
+                      text,
+                  )
+
+              if compute_is_pointer:
+                  text = re.sub(
+                      r"(?m)^([ \t]*)if \(context_struct_compute_av_fn\) \{\s*$",
+                      r"\1if (context_struct_compute_av_fn != NULL) {",
+                      text,
+                  )
+              else:
+                  text = re.sub(
+                      r"(?m)^([ \t]*)if \(context_struct_compute_av_fn\) \{\n"
+                      r"[ \t]*context_struct_compute_av_fn\(policydb, scontext, tcontext, tclass, avd, NULL\);\n"
+                      r"[ \t]*\} else \{\n"
+                      r"[ \t]*context_struct_compute_av\(policydb, scontext, tcontext, tclass, avd, NULL\);\n"
+                      r"[ \t]*\}\n",
+                      r"\1context_struct_compute_av_fn(policydb, scontext, tcontext, tclass, avd, NULL);\n",
+                      text,
+                  )
+
+              if text == original:
+                  return False
+
+              path.write_text(text)
+              print(f"已修复 {path} 的 Official selinux_hide 函数指针判断")
+              return True
+
           def ensure_official_susfs_objects(ksu_dir):
               kbuild = ksu_dir / "Kbuild"
               if not kbuild.exists():
@@ -2767,6 +2842,31 @@ jobs:
               block = "\n".join(["", "# ABK: selinux_hide.c still needs these hook helpers."] + missing + [""])
               kbuild.write_text(text.rstrip() + "\n" + block)
               print(f"已补回 {kbuild} 的 Official SUSFS hook helper 对象")
+              return True
+
+          def ensure_official_symbol_resolver_exports(ksu_dir):
+              path = ksu_dir / "infra/symbol_resolver.c"
+              if not path.exists():
+                  raise SystemExit(f"未找到 {path}，无法补齐 Official SUSFS hook 符号")
+
+              text = path.read_text()
+              if not re.search(r"(?m)^\s*void\s+\*\s*ksu_lookup_symbol\s*\(", text):
+                  raise SystemExit(f"{path} 缺少 ksu_lookup_symbol()，无法补齐 Official SUSFS hook 符号")
+
+              additions = []
+              if not re.search(r"(?m)^\s*void\s+\*\s*ksu_resolve_symbol_for_functable_hook\s*\(", text):
+                  additions.append("void *ksu_resolve_symbol_for_functable_hook(const char *symbol_name)\n{\n    return ksu_lookup_symbol(symbol_name);\n}\n")
+              if not re.search(r"(?m)^\s*unsigned long\s+find_kernel_symbol_exact\s*\(", text):
+                  additions.append("unsigned long find_kernel_symbol_exact(const char *symbol_name)\n{\n    return (unsigned long)ksu_lookup_symbol(symbol_name);\n}\n")
+              if not re.search(r"(?m)^\s*void\s+ksu_init_symbol_resolver\s*\(", text):
+                  additions.append("void ksu_init_symbol_resolver(void)\n{\n}\n")
+
+              if not additions:
+                  return False
+
+              block = "\n/* ABK: Official SUSFS lsm_hook compatibility exports. */\n" + "\n".join(additions)
+              path.write_text(text.rstrip() + "\n" + block)
+              print(f"已补齐 {path} 的 Official SUSFS hook 符号")
               return True
 
           ksu_dir = Path("common/drivers/kernelsu")
@@ -2820,6 +2920,8 @@ jobs:
                   print(f"已移除 {include_ksu} 中的 ksu_late_loaded 声明")
 
           changed = ensure_official_susfs_objects(ksu_dir) or changed
+          changed = patch_official_selinux_hide(ksu_dir) or changed
+          changed = ensure_official_symbol_resolver_exports(ksu_dir) or changed
 
           if not changed:
               print("Official SUSFS 源码兼容修复无需修改。")
@@ -3204,9 +3306,17 @@ jobs:
             from textwrap import dedent
 
             VARIANT = "${{ inputs.ksu_variant }}"
-            MARKER = "ABK: Android 13 5.15.41-5.15.137 Official/ReSukiSU kallsyms lookup rewrite"
-            LEGACY_MARKER = "ABK: Android 13 5.15.41-5.15.137 Official/ReSukiSU kallsyms weak reference"
-            TARGET_SOURCE = dedent(f"""\
+            SUBLEVEL = "${{ inputs.sub_level }}"
+            TARGETED_RESUKISU_SUBLEVELS = {"41", "74", "78", "94", "104", "119", "123", "137"}
+            TARGETED_RESUKISU = VARIANT == "ReSukiSU" and SUBLEVEL in TARGETED_RESUKISU_SUBLEVELS
+            if TARGETED_RESUKISU:
+                MARKER = "ABK: Android 13 5.15.{41,74,78,94,104,119,123,137} ReSukiSU kallsyms lookup rewrite"
+                LEGACY_MARKER = "ABK: Android 13 5.15.{41,74,78,94,104,119,123,137} ReSukiSU kallsyms weak reference"
+            else:
+                MARKER = "ABK: Android 13 5.15.41-5.15.137 Official/ReSukiSU kallsyms lookup rewrite"
+                LEGACY_MARKER = "ABK: Android 13 5.15.41-5.15.137 Official/ReSukiSU kallsyms weak reference"
+
+            BASE_TARGET_SOURCE = dedent(f"""\
             // SPDX-License-Identifier: GPL-2.0-only
             /*
              * {MARKER}.
@@ -3248,6 +3358,69 @@ jobs:
             #endif
             }}
             """)
+
+            TARGETED_RESUKISU_SOURCE = dedent(f"""\
+            // SPDX-License-Identifier: GPL-2.0-only
+            /*
+             * {MARKER}.
+             *
+             * The affected ReSukiSU GKI 5.15 builds reference newer symbol
+             * resolver entry points from LSM hook code. Keep the existing direct
+             * kallsyms_lookup_name path and provide the missing entry points only
+             * for the known failing Android 13 / 5.15 sublevels.
+             */
+            #include <linux/kernel.h>
+            #include <linux/string.h>
+            #include <linux/kallsyms.h>
+
+            #include "infra/symbol_resolver.h"
+
+            static const char cfi_suffix[] = ".cfi_jt";
+
+            static void *ksu_lookup_symbol_impl(const char *symbol_name)
+            {{
+            #ifdef CONFIG_KALLSYMS
+                unsigned long addr;
+                char cfi_name[KSYM_NAME_LEN];
+
+                if (!symbol_name || !symbol_name[0])
+                    return NULL;
+
+                addr = kallsyms_lookup_name(symbol_name);
+                if (addr)
+                    return (void *)addr;
+
+                if (scnprintf(cfi_name, sizeof(cfi_name), "%s%s", symbol_name, cfi_suffix) >= sizeof(cfi_name))
+                    return NULL;
+
+                addr = kallsyms_lookup_name(cfi_name);
+                return addr ? (void *)addr : NULL;
+            #else
+                return NULL;
+            #endif
+            }}
+
+            void *ksu_resolve_symbol_for_functable_hook(const char *symbol_name)
+            {{
+                return ksu_lookup_symbol_impl(symbol_name);
+            }}
+
+            unsigned long find_kernel_symbol_exact(const char *symbol_name)
+            {{
+                return (unsigned long)ksu_lookup_symbol_impl(symbol_name);
+            }}
+
+            void ksu_init_symbol_resolver(void)
+            {{
+            }}
+
+            void *ksu_lookup_symbol(const char *symbol_name)
+            {{
+                return ksu_lookup_symbol_impl(symbol_name);
+            }}
+            """)
+
+            TARGET_SOURCE = TARGETED_RESUKISU_SOURCE if TARGETED_RESUKISU else BASE_TARGET_SOURCE
 
             candidates = []
             seen = set()
@@ -3301,6 +3474,13 @@ jobs:
                     raise SystemExit(f"{path} 仍包含 kallsyms_on_each_symbol 直接调用")
                 if "__attribute__((weak))" in final_text:
                     raise SystemExit(f"{path} 仍包含 weak kallsyms extern")
+                if TARGETED_RESUKISU:
+                    if "ksu_resolve_symbol_for_functable_hook(" not in final_text:
+                        raise SystemExit(f"{path} 缺少 ksu_resolve_symbol_for_functable_hook() 目标实现")
+                    if "find_kernel_symbol_exact(" not in final_text:
+                        raise SystemExit(f"{path} 缺少 find_kernel_symbol_exact() 目标实现")
+                    if "ksu_init_symbol_resolver(" not in final_text:
+                        raise SystemExit(f"{path} 缺少 ksu_init_symbol_resolver() 目标实现")
                 if "void *ksu_lookup_symbol(const char *symbol_name)" not in final_text:
                     raise SystemExit(f"{path} 缺少 ksu_lookup_symbol() 目标实现")
                 if "kallsyms_lookup_name(symbol_name)" not in final_text:
@@ -3410,6 +3590,54 @@ jobs:
                     raise SystemExit(f"anchor not found: {anchor.strip()}")
                 return text.replace(anchor, anchor + line, 1)
 
+            def patch_official_selinux_hide(ksu_dir):
+                path = ksu_dir / "feature/selinux_hide.c"
+                if not path.exists():
+                    return False
+
+                text = path.read_text()
+                original = text
+
+                dump_is_pointer = re.search(r"\(\s*\*\s*security_dump_masked_av_fn\s*\)", text) is not None
+                compute_is_pointer = re.search(r"\(\s*\*\s*context_struct_compute_av_fn\s*\)", text) is not None
+
+                if dump_is_pointer:
+                    text = re.sub(
+                        r"(?m)^([ \t]*)if \(security_dump_masked_av_fn\)\s*$",
+                        r"\1if (security_dump_masked_av_fn != NULL)",
+                        text,
+                    )
+                else:
+                    text = re.sub(
+                        r'(?m)^([ \t]*)if \(security_dump_masked_av_fn\)\n[ \t]*security_dump_masked_av_fn\(policydb, scontext, tcontext, tclass, masked, "bounds"\);\n',
+                        r'\1security_dump_masked_av_fn(policydb, scontext, tcontext, tclass, masked, "bounds");\n',
+                        text,
+                    )
+
+                if compute_is_pointer:
+                    text = re.sub(
+                        r"(?m)^([ \t]*)if \(context_struct_compute_av_fn\) \{\s*$",
+                        r"\1if (context_struct_compute_av_fn != NULL) {",
+                        text,
+                    )
+                else:
+                    text = re.sub(
+                        r"(?m)^([ \t]*)if \(context_struct_compute_av_fn\) \{\n"
+                        r"[ \t]*context_struct_compute_av_fn\(policydb, scontext, tcontext, tclass, avd, NULL\);\n"
+                        r"[ \t]*\} else \{\n"
+                        r"[ \t]*context_struct_compute_av\(policydb, scontext, tcontext, tclass, avd, NULL\);\n"
+                        r"[ \t]*\}\n",
+                        r"\1context_struct_compute_av_fn(policydb, scontext, tcontext, tclass, avd, NULL);\n",
+                        text,
+                    )
+
+                if text == original:
+                    return False
+
+                path.write_text(text)
+                print(f"fixed {path}: normalized Official selinux_hide function checks")
+                return True
+
             def ensure_official_susfs_objects(ksu_dir):
                 kbuild = ksu_dir / "Kbuild"
                 if not kbuild.exists():
@@ -3429,6 +3657,31 @@ jobs:
                 block = "\n".join(["", "# ABK: selinux_hide.c still needs these hook helpers."] + missing + [""])
                 kbuild.write_text(text.rstrip() + "\n" + block)
                 print(f"fixed {kbuild}: restored Official SUSFS hook helper objects")
+                return True
+
+            def ensure_official_symbol_resolver_exports(ksu_dir):
+                path = ksu_dir / "infra/symbol_resolver.c"
+                if not path.exists():
+                    raise SystemExit(f"{path} not found before build")
+
+                text = path.read_text()
+                if not re.search(r"(?m)^\s*void\s+\*\s*ksu_lookup_symbol\s*\(", text):
+                    raise SystemExit(f"{path} does not define ksu_lookup_symbol()")
+
+                additions = []
+                if not re.search(r"(?m)^\s*void\s+\*\s*ksu_resolve_symbol_for_functable_hook\s*\(", text):
+                    additions.append("void *ksu_resolve_symbol_for_functable_hook(const char *symbol_name)\n{\n    return ksu_lookup_symbol(symbol_name);\n}\n")
+                if not re.search(r"(?m)^\s*unsigned long\s+find_kernel_symbol_exact\s*\(", text):
+                    additions.append("unsigned long find_kernel_symbol_exact(const char *symbol_name)\n{\n    return (unsigned long)ksu_lookup_symbol(symbol_name);\n}\n")
+                if not re.search(r"(?m)^\s*void\s+ksu_init_symbol_resolver\s*\(", text):
+                    additions.append("void ksu_init_symbol_resolver(void)\n{\n}\n")
+
+                if not additions:
+                    return False
+
+                block = "\n/* ABK: Official SUSFS lsm_hook compatibility exports. */\n" + "\n".join(additions)
+                path.write_text(text.rstrip() + "\n" + block)
+                print(f"fixed {path}: added Official SUSFS hook symbol exports")
                 return True
 
             ksu_dir = Path("common/drivers/kernelsu")
@@ -3472,6 +3725,8 @@ jobs:
                     print(f"fixed {include_ksu}")
 
             fixed = ensure_official_susfs_objects(ksu_dir) or fixed
+            fixed = patch_official_selinux_hide(ksu_dir) or fixed
+            fixed = ensure_official_symbol_resolver_exports(ksu_dir) or fixed
 
             if not fixed:
                 print("Official SUSFS KernelSU init.c already fixed")
@@ -3490,6 +3745,12 @@ jobs:
                 && { ! grep -qF 'hook/lsm_hook.o' common/drivers/kernelsu/Kbuild \
                   || ! grep -qF 'hook/arm64/patch_memory.o' common/drivers/kernelsu/Kbuild; }; then
                 echo "::error::Official SUSFS 缺少 common/drivers/kernelsu Kbuild hook helper 对象"
+                exit 1
+              fi
+              if [ -f common/drivers/kernelsu/infra/symbol_resolver.c ] \
+                && { ! grep -qF 'ksu_resolve_symbol_for_functable_hook' common/drivers/kernelsu/infra/symbol_resolver.c \
+                  || ! grep -qF 'find_kernel_symbol_exact' common/drivers/kernelsu/infra/symbol_resolver.c; }; then
+                echo "::error::Official SUSFS 缺少 symbol_resolver hook 兼容符号"
                 exit 1
               fi
             fi
