@@ -2632,14 +2632,17 @@ jobs:
             sed -i '/kmi_symbol_list_strict_mode/d' ./common/BUILD.bazel
             rm -rf ./common/android/abi_gki_protected_exports_*
             sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl
+            sed -i 's/-dirty//' ./common/scripts/setlocalversion
           fi
 
           VERSION_INPUT=$(echo "${{ inputs.version }}" | tr -d '[:space:]')
           if [ -n "$VERSION_INPUT" ]; then
             CLEAN_VERSION=$(echo "$VERSION_INPUT" | sed -E 's/^[0-9]+\.[0-9]+\.[0-9]+//')
+            sed -i 's/${scm_version}//' ./common/scripts/setlocalversion
             perl -i -0777 -pe 's/(.*)echo "\$\{KERNELVERSION\}\$\{file_localversion\}\$\{config_localversion\}\$\{LOCALVERSION\}\$\{scm_version\}"/$1echo "\$\{KERNELVERSION\}'"${CLEAN_VERSION}"'"/s' ./common/scripts/setlocalversion 2>/dev/null || true
             sed -i "\$s|echo \"\$res\"|echo \"${CLEAN_VERSION}\"|" ./common/scripts/setlocalversion 2>/dev/null || true
             sed -i '/^CONFIG_LOCALVERSION=/ s/="\([^"]*\)"/="'"$CLEAN_VERSION"'"/' ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_LOCALVERSION_AUTO=n" >> ./common/arch/arm64/configs/gki_defconfig
           elif [ ! -f "build/build.sh" ]; then
             cd ./common
             BID="ab$((RANDOM % 90000000 + 10000000))"
